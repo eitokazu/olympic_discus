@@ -450,9 +450,9 @@ with tab_predict:
             title=f"Predicted distance vs {FEATURE_LABELS.get(vary_feat, vary_feat)}",
             xaxis_title=FEATURE_LABELS.get(vary_feat, vary_feat),
             yaxis_title="Predicted Distance (m)",
-            height=380,
-            legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0),
-            margin=dict(t=70, b=40, l=10, r=20),
+            height=420,
+            legend=dict(orientation='h', yanchor='top', y=-0.20, x=0, xanchor='left'),
+            margin=dict(t=50, b=100, l=10, r=20),
         )
         st.plotly_chart(fig_wi, use_container_width=True)
 
