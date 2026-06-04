@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+from scipy import stats
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import plotly.graph_objects as go
@@ -79,10 +80,25 @@ def train_model(features_tuple):
     df = load_data()
     X = prepare_X(df, list(features_tuple))
     y = df[TARGET].astype(float)
+    n, p = X.shape
     mdl = LinearRegression(fit_intercept=True)
     mdl.fit(X, y)
     pred = mdl.predict(X)
-    return mdl, X.columns.tolist(), pred, y.values
+    # Precompute components needed for exact OLS prediction intervals
+    X_aug   = np.column_stack([np.ones(n), X.values])
+    XtX_inv = np.linalg.inv(X_aug.T @ X_aug)
+    s_resid = np.sqrt(np.sum((y.values - pred) ** 2) / (n - p - 1))
+    return mdl, X.columns.tolist(), pred, y.values, XtX_inv, s_resid, n
+
+def compute_interval(mdl, XtX_inv, s_resid, n_train, x_row_df, confidence):
+    """Return (y_hat, lower, upper) OLS prediction interval for one row."""
+    y_hat = mdl.predict(x_row_df)[0]
+    x_vec = np.concatenate([[1.0], x_row_df.values[0]])
+    leverage = float(x_vec @ XtX_inv @ x_vec)
+    se = s_resid * np.sqrt(1.0 + leverage)
+    t_crit = stats.t.ppf((1 + confidence) / 2, df=n_train - x_row_df.shape[1] - 1)
+    margin = t_crit * se
+    return y_hat, y_hat - margin, y_hat + margin
 
 def build_row(input_vals: dict, train_cols: list) -> pd.DataFrame:
     """Convert UI input values to a model-ready single-row DataFrame."""
@@ -116,6 +132,15 @@ use_estimates = st.sidebar.toggle("Athleticism Estimates", value=False,
 use_travel    = st.sidebar.toggle("Travel Logistics", value=True,
     help="Days away from home, meet number within the trip, overseas flag")
 
+st.sidebar.divider()
+confidence = st.sidebar.select_slider(
+    "Prediction interval",
+    options=[0.80, 0.90, 0.95],
+    value=0.90,
+    format_func=lambda x: f"{int(x * 100)}%",
+    help="How confident should the interval be? Wider = more certain the true throw lands inside.",
+)
+
 features = []
 if use_strength:  features += QUANTITATIVE
 if use_bw:        features += ['Weight']
@@ -127,7 +152,7 @@ if not features:
     st.stop()
 
 # ── Train ─────────────────────────────────────────────────────────────────────
-model, train_cols, pred_arr, y_arr = train_model(tuple(features))
+model, train_cols, pred_arr, y_arr, XtX_inv, s_resid, n_train = train_model(tuple(features))
 
 r2   = r2_score(y_arr, pred_arr)
 mae  = mean_absolute_error(y_arr, pred_arr)
@@ -228,7 +253,10 @@ with tab_predict:
                 input_vals[feat] = 1 if sel == 'Overseas' else 0
 
     # ── Prediction display ────────────────────────────────────────────────────
-    prediction = model.predict(build_row(input_vals, train_cols))[0]
+    pred_row = build_row(input_vals, train_cols)
+    prediction, pi_lo, pi_hi = compute_interval(
+        model, XtX_inv, s_resid, n_train, pred_row, confidence
+    )
     pb  = df[TARGET].max()
     med = df[TARGET].median()
 
@@ -243,16 +271,25 @@ with tab_predict:
             f"line-height:1.1'>{prediction:.2f} m</div>",
             unsafe_allow_html=True,
         )
+        st.markdown(
+            f"**{int(confidence*100)}% interval:** {pi_lo:.2f} – {pi_hi:.2f} m",
+        )
         gap = prediction - pb
         st.markdown(f"**PB:** {pb:.2f} m &nbsp;·&nbsp; **Gap to PB:** {gap:+.2f} m")
         st.caption(f"Historical median: {med:.2f} m")
 
     with right:
         fig_hist = go.Figure()
+        fig_hist.add_vrect(
+            x0=pi_lo, x1=pi_hi,
+            fillcolor=TEAL, opacity=0.12,
+            layer='below', line_width=0,
+        )
         fig_hist.add_trace(go.Histogram(
             x=df[TARGET], nbinsx=14,
             marker_color=BLUE, opacity=0.55,
             hovertemplate='%{x:.1f} m: %{y} meets',
+            name='Historical results',
         ))
         fig_hist.add_vline(
             x=prediction, line_color=TEAL, line_width=2.5,
@@ -264,7 +301,7 @@ with tab_predict:
             annotation_text="Median", annotation_position="top left",
         )
         fig_hist.update_layout(
-            title="Where this prediction falls in your competition history",
+            title=f"Where this prediction falls — shaded band = {int(confidence*100)}% interval",
             xaxis_title="Distance (m)", yaxis_title="Number of meets",
             showlegend=False, height=260,
             margin=dict(t=40, b=30, l=10, r=20),
@@ -334,19 +371,44 @@ with tab_predict:
             sweep = np.arange(rng[0], rng[1] + 1, 2, dtype=float)
 
     with wi_right:
-        sweep_preds = np.array([
-            model.predict(build_row({**input_vals, vary_feat: v}, train_cols))[0]
+        sweep_results = [
+            compute_interval(model, XtX_inv, s_resid, n_train,
+                             build_row({**input_vals, vary_feat: v}, train_cols),
+                             confidence)
             for v in sweep
-        ])
+        ]
+        sweep_preds = np.array([r[0] for r in sweep_results])
+        sweep_lower = np.array([r[1] for r in sweep_results])
+        sweep_upper = np.array([r[2] for r in sweep_results])
 
         # Prediction at the adjusted (slider) value
         adj_val  = float(cur_val)
-        adj_pred = model.predict(build_row({**input_vals, vary_feat: adj_val}, train_cols))[0]
+        adj_pred, adj_lo, adj_hi = compute_interval(
+            model, XtX_inv, s_resid, n_train,
+            build_row({**input_vals, vary_feat: adj_val}, train_cols), confidence
+        )
 
         # Prediction at the last competition value (holding other sliders as-is)
-        last_pred = model.predict(build_row({**input_vals, vary_feat: last_val}, train_cols))[0]
+        last_pred, _, _ = compute_interval(
+            model, XtX_inv, s_resid, n_train,
+            build_row({**input_vals, vary_feat: last_val}, train_cols), confidence
+        )
 
         fig_wi = go.Figure()
+        # Interval band — drawn first so line sits on top
+        fig_wi.add_trace(go.Scatter(
+            x=sweep, y=sweep_upper,
+            mode='lines', line=dict(width=0),
+            showlegend=False, hoverinfo='skip',
+        ))
+        fig_wi.add_trace(go.Scatter(
+            x=sweep, y=sweep_lower,
+            mode='lines', line=dict(width=0),
+            fill='tonexty',
+            fillcolor='rgba(55, 138, 221, 0.15)',
+            name=f'{int(confidence*100)}% prediction interval',
+            hoverinfo='skip',
+        ))
         fig_wi.add_trace(go.Scatter(
             x=sweep, y=sweep_preds,
             mode='lines+markers',
@@ -355,7 +417,10 @@ with tab_predict:
             name='Predicted distance',
             hovertemplate=(
                 f"{FEATURE_LABELS.get(vary_feat, vary_feat)}: %{{x}}<br>"
-                "Predicted: %{y:.2f} m"
+                f"Predicted: %{{y:.2f}} m<br>"
+                f"{int(confidence*100)}% interval: "
+                + f"{sweep_lower[0]:.1f}–{sweep_upper[0]:.1f} m"
+                if len(sweep_lower) else ""
             ),
         ))
         # Last competition reference — circle on the curve
