@@ -5,6 +5,8 @@ from scipy import stats
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import plotly.graph_objects as go
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -19,6 +21,16 @@ CORAL = '#D85A30'
 AMBER = '#BA7517'
 TEAL  = '#1D9E75'
 GRAY  = '#888780'
+
+# Throw type colours: (line colour, fill rgba)
+THROW_COLORS = {
+    'easy fulls':   ('#A8D4F5', 'rgba(168,212,245,0.20)'),
+    'medium fulls': ('#378ADD', 'rgba(55,138,221,0.20)'),
+    'hard fulls':   ('#1A4F8A', 'rgba(26,79,138,0.20)'),
+    'easy nons':    ('#F5B89A', 'rgba(245,184,154,0.20)'),
+    'medium nons':  ('#D85A30', 'rgba(216,90,48,0.20)'),
+    'hard nons':    ('#7A2910', 'rgba(122,41,16,0.20)'),
+}
 
 # ── Feature definitions ───────────────────────────────────────────────────────
 QUANTITATIVE = ['Bench', 'Squat', 'Clean', 'Snatch']
@@ -65,6 +77,30 @@ def load_data():
     df['Year'] = df['Date'].dt.year
     df.sort_values(by='Date', inplace=True, ignore_index=True)
     return df
+
+# ── Practice throws loader ────────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def load_practice_data():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_file("throws-data-conn.json", scopes=scopes)
+    client = gspread.authorize(creds)
+    records = client.open("Throw Data Tracking").sheet1.get_all_records()
+    df = pd.DataFrame(records)
+    df = df[df['Date'].astype(str).str.strip() != ''].copy()
+    # Normalize dates: entries without a year (only one "/") default to 2026
+    df['Date'] = pd.to_datetime(
+        df['Date'].apply(lambda d: d if str(d).count('/') == 2 else f"{d}/2026"),
+        format='mixed', errors='coerce',
+    )
+    df = df.dropna(subset=['Date'])
+    for col in ['avg_distance', 'min_distance', 'max_distance', 'num_throws', 'connected_throws']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df = df.dropna(subset=['num_throws', 'avg_distance'])
+    df['notes'] = df['notes'].astype(str).str.strip().replace({'nan': '', 'None': ''})
+    return df.sort_values('Date').reset_index(drop=True)
 
 # ── Model helpers ─────────────────────────────────────────────────────────────
 def prepare_X(df, features):
@@ -174,7 +210,7 @@ c3.metric("RMSE", f"{rmse:.3f} m", help="Root mean squared error; penalises larg
 st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_predict, tab_perf = st.tabs(["🎯  Predict My Throw", "📊  Model Performance"])
+tab_predict, tab_perf, tab_practice = st.tabs(["🎯  Predict My Throw", "📊  Model Performance", "🏋️  Practice Throws"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -543,3 +579,142 @@ with tab_perf:
         margin=dict(t=50, b=40),
     )
     st.plotly_chart(fig_resid, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 3 – PRACTICE THROWS
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_practice:
+    try:
+        prac = load_practice_data()
+    except Exception as e:
+        st.error(f"Could not load practice data from Google Sheets: {e}")
+        st.stop()
+
+    ALL_THROW_TYPES = [
+        'easy fulls', 'medium fulls', 'hard fulls',
+        'easy nons',  'medium nons',  'hard nons',
+    ]
+
+    st.subheader("Practice Throw Log")
+    hdr_p_left, hdr_p_right = st.columns([5, 1])
+    hdr_p_left.caption(
+        f"Live from Google Sheets · **{len(prac)} sessions** · "
+        f"{prac['Date'].dt.strftime('%b %d').iloc[0]} – {prac['Date'].dt.strftime('%b %d, %Y').iloc[-1]}"
+    )
+    if hdr_p_right.button("↺  Refresh", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    # ── Throw-type toggles ────────────────────────────────────────────────────
+    st.markdown("**Show throw types:**")
+    tog_cols = st.columns(6)
+    toggle_labels = {
+        'easy fulls':   'Easy Fulls',
+        'medium fulls': 'Med Fulls',
+        'hard fulls':   'Hard Fulls',
+        'easy nons':    'Easy Nons',
+        'medium nons':  'Med Nons',
+        'hard nons':    'Hard Nons',
+    }
+    active_types = [
+        t for t, col in zip(ALL_THROW_TYPES, tog_cols)
+        if col.toggle(toggle_labels[t], value=True, key=f"tog_{t}")
+    ]
+
+    if not active_types:
+        st.info("Enable at least one throw type above to see the chart.")
+    else:
+        plot_prac = prac[prac['throw_type'].isin(active_types)]
+
+        fig_prac = go.Figure()
+
+        for throw_type in ALL_THROW_TYPES:
+            if throw_type not in active_types:
+                continue
+            line_color, fill_color = THROW_COLORS[throw_type]
+            sub = plot_prac[plot_prac['throw_type'] == throw_type].sort_values('Date')
+            if sub.empty:
+                continue
+
+            # Min/max shaded band
+            x_band = list(sub['Date']) + list(sub['Date'])[::-1]
+            y_band = list(sub['max_distance']) + list(sub['min_distance'].iloc[::-1])
+            fig_prac.add_trace(go.Scatter(
+                x=x_band, y=y_band,
+                fill='toself', fillcolor=fill_color,
+                line=dict(width=0), mode='lines',
+                showlegend=False, hoverinfo='skip',
+            ))
+
+            # Build hover text — include note only when present
+            hover_texts = []
+            for _, row in sub.iterrows():
+                tip = (
+                    f"<b>{toggle_labels[throw_type]}</b> · {row['Date'].strftime('%b %d, %Y')}<br>"
+                    f"Avg: {row['avg_distance']:.1f} m &nbsp;|&nbsp; "
+                    f"Range: {row['min_distance']:.0f}–{row['max_distance']:.0f} m<br>"
+                    f"Throws: {int(row['num_throws'])}"
+                    + (f" &nbsp;({int(row['connected_throws'])} connected)" if pd.notna(row['connected_throws']) else "")
+                )
+                if row['notes']:
+                    tip += f"<br><i>📝 {row['notes']}</i>"
+                hover_texts.append(tip)
+
+            has_note = sub['notes'].ne('').tolist()
+
+            # Avg distance line + markers
+            fig_prac.add_trace(go.Scatter(
+                x=sub['Date'],
+                y=sub['avg_distance'],
+                mode='lines+markers',
+                name=toggle_labels[throw_type],
+                line=dict(color=line_color, width=2.5),
+                marker=dict(
+                    color=line_color,
+                    size=[13 if n else 8 for n in has_note],
+                    symbol=['diamond' if n else 'circle' for n in has_note],
+                    line=dict(color='white', width=[1.5 if n else 0 for n in has_note]),
+                ),
+                text=hover_texts,
+                hovertemplate='%{text}<extra></extra>',
+            ))
+
+        fig_prac.update_layout(
+            title='Practice Throw Distances Over Time  (band = min–max range; ◆ = session note)',
+            xaxis_title='Date',
+            yaxis_title='Distance (m)',
+            height=500,
+            hovermode='closest',
+            legend=dict(orientation='h', yanchor='top', y=-0.14, x=0, xanchor='left'),
+            margin=dict(t=55, b=90, l=10, r=20),
+        )
+        st.plotly_chart(fig_prac, use_container_width=True)
+
+        # ── Summary stats per throw type ──────────────────────────────────────
+        st.divider()
+        st.markdown("**Session summary by throw type**")
+        summary = (
+            plot_prac.groupby('throw_type')
+            .agg(
+                Sessions   =('Date', 'count'),
+                Avg_dist   =('avg_distance', 'mean'),
+                Best_single=('max_distance', 'max'),
+                Avg_throws =('num_throws', 'mean'),
+            )
+            .reindex([t for t in ALL_THROW_TYPES if t in plot_prac['throw_type'].unique()])
+            .rename(columns={
+                'Sessions':    'Sessions',
+                'Avg_dist':    'Avg distance (m)',
+                'Best_single': 'Best single throw (m)',
+                'Avg_throws':  'Avg throws/session',
+            })
+        )
+        st.dataframe(
+            summary.style.format({
+                'Avg distance (m)':     '{:.1f}',
+                'Best single throw (m)': '{:.1f}',
+                'Avg throws/session':    '{:.1f}',
+            }),
+            use_container_width=True,
+        )
