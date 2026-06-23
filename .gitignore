@@ -6,3 +6,5 @@ __pycache__/
 *.pdf
 *.html
 reports/
+throws-data-conn.json
+.streamlit/secrets.toml
